@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createWriteStream } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { pipeline } from 'node:stream/promises';
+import * as tar from 'tar';
 import unzipper from 'unzipper';
 import type { AppConfig } from './config.js';
 import type { ImportJob, ImportRequestInput, ManifestV1, ResolvedPackage } from './types.js';
@@ -23,6 +24,9 @@ async function extractZip(zipPath: string, destDir: string): Promise<void> {
     if (isPathTraversal(entryPath)) {
       throw new Error(`拒绝不安全的 zip 路径：${entryPath}`);
     }
+    if (entry.type !== 'File' && entry.type !== 'Directory') {
+      throw new Error(`拒绝不支持的 zip 条目：${entryPath}`);
+    }
     const targetPath = path.join(destDir, entryPath);
     if (entry.type === 'Directory') {
       fs.mkdirSync(targetPath, { recursive: true });
@@ -31,6 +35,81 @@ async function extractZip(zipPath: string, destDir: string): Promise<void> {
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     await pipeline(entry.stream(), createWriteStream(targetPath));
   }
+}
+
+async function extractTarGz(archivePath: string, destDir: string): Promise<void> {
+  fs.mkdirSync(destDir, { recursive: true });
+  const entries = await new Promise<Array<{ path: string; type: string }>>((resolve, reject) => {
+    const collected: Array<{ path: string; type: string }> = [];
+    tar
+      .t({
+        file: archivePath,
+        strict: true,
+        onentry: (entry) => collected.push({ path: entry.path, type: entry.type })
+      })
+      .then(() => resolve(collected))
+      .catch(reject);
+  });
+
+  for (const entry of entries) {
+    if (isPathTraversal(entry.path)) {
+      throw new Error(`拒绝不安全的 tar 路径：${entry.path}`);
+    }
+    if (entry.type !== 'File' && entry.type !== 'Directory') {
+      throw new Error(`拒绝不支持的 tar 条目：${entry.path}`);
+    }
+  }
+
+  await tar.x({
+    file: archivePath,
+    cwd: destDir,
+    strict: true
+  });
+}
+
+function isPorterArchive(destDir: string): boolean {
+  const manifestPath = path.join(destDir, 'manifest.json');
+  const tarballDir = path.join(destDir, 'tarballs');
+  return (
+    fs.existsSync(manifestPath) &&
+    fs.existsSync(tarballDir) &&
+    fs.statSync(tarballDir).isDirectory()
+  );
+}
+
+function locatePackageRoot(destDir: string): string {
+  if (fs.existsSync(path.join(destDir, 'package.json'))) {
+    return destDir;
+  }
+
+  const entries = fs.readdirSync(destDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  const candidates = entries
+    .map((entry) => path.join(destDir, entry.name))
+    .filter((dir) => fs.existsSync(path.join(dir, 'package.json')));
+
+  if (candidates.length === 1) {
+    return candidates[0];
+  }
+  if (candidates.length > 1) {
+    throw new Error('压缩包包含多个包目录，请分别上传或使用 npm-porter 导出 zip');
+  }
+  throw new Error('压缩包中未找到 package.json');
+}
+
+function readPackageIdentity(pkgRoot: string): { name: string; version: string; scoped: boolean } {
+  const pkg = JSON.parse(fs.readFileSync(path.join(pkgRoot, 'package.json'), 'utf8')) as {
+    name?: unknown;
+    version?: unknown;
+  };
+  if (typeof pkg.name !== 'string' || !pkg.name.trim()) {
+    throw new Error('package.json 缺少有效的 name');
+  }
+  if (typeof pkg.version !== 'string' || !pkg.version.trim()) {
+    throw new Error('package.json 缺少有效的 version');
+  }
+  const name = pkg.name.trim();
+  const version = pkg.version.trim();
+  return { name, version, scoped: name.startsWith('@') };
 }
 
 function readManifest(destDir: string): ManifestV1 {
@@ -136,15 +215,15 @@ function buildNpmrc(input: ImportRequestInput): string {
   return `${lines.join('\n')}\n`;
 }
 
-async function publishTarball(input: {
-  tarballPath: string;
+async function publishPackage(input: {
+  publishPath: string;
   registry: string;
   npmrcPath: string;
   scoped: boolean;
 }): Promise<void> {
   const args = [
     'publish',
-    input.tarballPath,
+    input.publishPath,
     `--registry=${input.registry}`,
     `--userconfig=${input.npmrcPath}`,
     '--ignore-scripts',
@@ -168,6 +247,27 @@ async function publishTarball(input: {
   });
 }
 
+function detectArchiveKind(archivePath: string): 'zip' | 'tgz' {
+  const fd = fs.openSync(archivePath, 'r');
+  const header = Buffer.alloc(4);
+  try {
+    fs.readSync(fd, header, 0, header.length, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (header[0] === 0x1f && header[1] === 0x8b) return 'tgz';
+  if (header[0] === 0x50 && header[1] === 0x4b) return 'zip';
+  throw new Error('不支持的归档格式，仅支持 zip / tgz / tar.gz');
+}
+
+async function extractArchive(archivePath: string, destDir: string): Promise<void> {
+  if (detectArchiveKind(archivePath) === 'tgz') {
+    await extractTarGz(archivePath, destDir);
+    return;
+  }
+  await extractZip(archivePath, destDir);
+}
+
 export async function runImportJob(input: {
   job: ImportJob;
   data: ImportRequestInput;
@@ -179,72 +279,120 @@ export async function runImportJob(input: {
 
   try {
     if (!job.zipPath || !fs.existsSync(job.zipPath)) {
-      throw new Error('上传的 zip 不存在或已丢失');
+      throw new Error('上传的归档文件不存在或已丢失');
     }
     store.update(job.id, { status: 'publishing', progress: 0, total: 0, message: '正在解包并校验…' });
 
     const workDir = path.join(config.dataDir, 'work', job.id, 'import');
-    await extractZip(job.zipPath, workDir);
-    const manifest = readManifest(workDir);
-    verifyManifestTarballs(workDir, manifest);
-
-    const ordered = topologicalSort(manifest.packages);
-    store.update(job.id, {
-      manifest,
-      total: ordered.length,
-      progress: 0,
-      message: `校验通过，准备发布 ${ordered.length} 个包`
-    });
+    await extractArchive(job.zipPath, workDir);
 
     npmrcPath = path.join(config.dataDir, 'work', job.id, '.npmrc');
     fs.writeFileSync(npmrcPath, buildNpmrc(data), { encoding: 'utf8', mode: 0o600 });
     fs.chmodSync(npmrcPath, 0o600);
 
-    let failed = 0;
-    for (const [index, pkg] of ordered.entries()) {
-      const fileName = pkg.tarball || `${pkg.name.replace('/', '__')}@${pkg.version}.tgz`;
-      const tarballPath = path.join(workDir, 'tarballs', fileName);
-      const scoped = pkg.name.startsWith('@');
-      const resultEntry = job.results.find((item) => item.name === pkg.name && item.version === pkg.version) ?? {
-        name: pkg.name,
-        version: pkg.version,
-        status: 'pending'
-      };
-      resultEntry.status = 'publishing';
+    if (isPorterArchive(workDir)) {
+      const manifest = readManifest(workDir);
+      verifyManifestTarballs(workDir, manifest);
+      const ordered = topologicalSort(manifest.packages);
       store.update(job.id, {
-        progress: index,
-        message: `正在发布 ${pkg.name}@${pkg.version}（${index + 1}/${ordered.length}）`,
-        results: [...job.results.filter((item) => !(item.name === pkg.name && item.version === pkg.version)), resultEntry]
+        manifest,
+        total: ordered.length,
+        progress: 0,
+        message: `校验通过，准备发布 ${ordered.length} 个包`
       });
 
-      try {
-        await publishTarball({ tarballPath, registry: data.registry, npmrcPath: npmrcPath, scoped });
-        resultEntry.status = 'success';
-        resultEntry.error = undefined;
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        if (errorMessage.includes('E409') || errorMessage.includes('already present') || errorMessage.includes('conflict')) {
-          resultEntry.status = 'skipped';
-          resultEntry.error = '目标私服已存在该版本，已跳过';
-        } else {
-          failed += 1;
-          resultEntry.status = 'failed';
-          resultEntry.error = errorMessage;
+      let failed = 0;
+      for (const [index, pkg] of ordered.entries()) {
+        const fileName = pkg.tarball || `${pkg.name.replace('/', '__')}@${pkg.version}.tgz`;
+        const publishPath = path.join(workDir, 'tarballs', fileName);
+        const scoped = pkg.name.startsWith('@');
+        const resultEntry = job.results.find((item) => item.name === pkg.name && item.version === pkg.version) ?? {
+          name: pkg.name,
+          version: pkg.version,
+          status: 'pending'
+        };
+        resultEntry.status = 'publishing';
+        store.update(job.id, {
+          progress: index,
+          message: `正在发布 ${pkg.name}@${pkg.version}（${index + 1}/${ordered.length}）`,
+          results: [...job.results.filter((item) => !(item.name === pkg.name && item.version === pkg.version)), resultEntry]
+        });
+
+        try {
+          await publishPackage({ publishPath, registry: data.registry, npmrcPath, scoped });
+          resultEntry.status = 'success';
+          resultEntry.error = undefined;
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage.includes('E409') || errorMessage.includes('already present') || errorMessage.includes('conflict')) {
+            resultEntry.status = 'skipped';
+            resultEntry.error = '目标私服已存在该版本，已跳过';
+          } else {
+            failed += 1;
+            resultEntry.status = 'failed';
+            resultEntry.error = errorMessage;
+          }
         }
+
+        store.update(job.id, {
+          progress: index + 1,
+          total: ordered.length,
+          results: [...job.results.filter((item) => !(item.name === pkg.name && item.version === pkg.version)), resultEntry]
+        });
       }
 
       store.update(job.id, {
-        progress: index + 1,
+        status: failed === 0 ? 'done' : 'partial',
+        progress: ordered.length,
         total: ordered.length,
-        results: [...job.results.filter((item) => !(item.name === pkg.name && item.version === pkg.version)), resultEntry]
+        message: failed === 0 ? '发布完成' : `发布完成，${failed} 个包失败`
       });
+      return;
+    }
+
+    const pkgRoot = locatePackageRoot(workDir);
+    const identity = readPackageIdentity(pkgRoot);
+    store.update(job.id, {
+      total: 1,
+      progress: 0,
+      message: `校验通过，准备发布 ${identity.name}@${identity.version}`
+    });
+
+    const resultEntry = job.results.find((item) => item.name === identity.name && item.version === identity.version) ?? {
+      name: identity.name,
+      version: identity.version,
+      status: 'pending'
+    };
+    resultEntry.status = 'publishing';
+    store.update(job.id, {
+      progress: 0,
+      message: `正在发布 ${identity.name}@${identity.version}`,
+      results: [...job.results.filter((item) => !(item.name === identity.name && item.version === identity.version)), resultEntry]
+    });
+
+    let failed = 0;
+    try {
+      await publishPackage({ publishPath: pkgRoot, registry: data.registry, npmrcPath, scoped: identity.scoped });
+      resultEntry.status = 'success';
+      resultEntry.error = undefined;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      if (errorMessage.includes('E409') || errorMessage.includes('already present') || errorMessage.includes('conflict')) {
+        resultEntry.status = 'skipped';
+        resultEntry.error = '目标私服已存在该版本，已跳过';
+      } else {
+        failed += 1;
+        resultEntry.status = 'failed';
+        resultEntry.error = errorMessage;
+      }
     }
 
     store.update(job.id, {
       status: failed === 0 ? 'done' : 'partial',
-      progress: ordered.length,
-      total: ordered.length,
-      message: failed === 0 ? '发布完成' : `发布完成，${failed} 个包失败`
+      progress: 1,
+      total: 1,
+      message: failed === 0 ? '发布完成' : `发布完成，${failed} 个包失败`,
+      results: [...job.results.filter((item) => !(item.name === identity.name && item.version === identity.version)), resultEntry]
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -80,7 +80,7 @@ function handleUpload(options: { file: UploadFileInfo }): void {
 
 async function submitImport(): Promise<void> {
   if (!uploadFile.value) {
-    message.warning('请先上传 zip 文件')
+    message.warning('请先上传包归档')
     return
   }
   try {
@@ -156,7 +156,7 @@ const resultColumns: DataTableColumns<ImportPackageResult> = [
 
 <template>
   <div class="import-page">
-    <PageHeader title="导入发布" description="把 npm-porter 导出的离线包发布到目标 Verdaccio。">
+    <PageHeader title="导入发布" description="把 npm-porter 导出的离线包或单个 npm 包归档发布到目标 Verdaccio。">
       <template #extra>
         <n-tag type="warning" round size="large">
         内网模式
@@ -172,12 +172,12 @@ const resultColumns: DataTableColumns<ImportPackageResult> = [
           </template>
 
           <n-form label-placement="top" class="import-form">
-            <n-form-item label="离线包">
-              <n-upload :default-upload="false" :max="1" accept=".zip" @change="handleUpload" class="zip-upload">
+            <n-form-item label="包归档">
+              <n-upload :default-upload="false" :max="1" accept=".zip,.tgz,.tar.gz" @change="handleUpload" class="zip-upload">
                 <n-upload-dragger>
                   <div class="upload-inner">
-                    <p>点击或拖拽 zip 文件到此处</p>
-                    <p class="upload-hint">仅支持 npm-porter 导出的离线包</p>
+                    <p>点击或拖拽包归档文件到此处</p>
+                    <p class="upload-hint">支持 npm-porter 导出 zip，或单个 npm 包的 zip / tgz / tar.gz</p>
                   </div>
                 </n-upload-dragger>
               </n-upload>
@@ -228,7 +228,7 @@ const resultColumns: DataTableColumns<ImportPackageResult> = [
 
           <div class="summary-list">
             <div class="summary-item">
-              <span>离线包</span>
+              <span>包归档</span>
               <strong>{{ uploadFileName || '未选择' }}</strong>
             </div>
             <div class="summary-item">

@@ -19,16 +19,42 @@ function parseJsonField(value: unknown): unknown {
   }
 }
 
-async function readMultipart(request: FastifyRequest): Promise<Record<string, string | Buffer>> {
-  const result: Record<string, string | Buffer> = {};
+type MultipartField =
+  | { kind: 'field'; value: string }
+  | { kind: 'file'; value: Buffer; filename?: string };
+
+async function readMultipart(request: FastifyRequest): Promise<Record<string, MultipartField>> {
+  const result: Record<string, MultipartField> = {};
   for await (const part of request.parts()) {
     if (part.type === 'file') {
-      result[part.fieldname] = await part.toBuffer();
+      result[part.fieldname] = {
+        kind: 'file',
+        value: await part.toBuffer(),
+        filename: part.filename
+      };
     } else {
-      result[part.fieldname] = String((part as { value?: unknown }).value ?? '');
+      result[part.fieldname] = {
+        kind: 'field',
+        value: String((part as { value?: unknown }).value ?? '')
+      };
     }
   }
   return result;
+}
+
+function fieldValue(parts: Record<string, MultipartField>, name: string): string | undefined {
+  const field = parts[name];
+  return field?.kind === 'field' ? field.value : undefined;
+}
+
+function fileValue(parts: Record<string, MultipartField>, name: string): Buffer | undefined {
+  const field = parts[name];
+  return field?.kind === 'file' ? field.value : undefined;
+}
+
+function fileField(parts: Record<string, MultipartField>, name: string): Extract<MultipartField, { kind: 'file' }> | undefined {
+  const field = parts[name];
+  return field?.kind === 'file' ? field : undefined;
 }
 
 export async function registerApiRoutes(app: FastifyInstance, config: AppConfig): Promise<void> {
@@ -67,12 +93,12 @@ export async function registerApiRoutes(app: FastifyInstance, config: AppConfig)
     if (request.isMultipart()) {
       const parts = await readMultipart(request);
       data = {
-        source: (parts.source as string) as ExportRequestInput['source'],
-        registry: parts.registry as string | undefined,
-        targets: parseJsonField(parts.targets) as ExportRequestInput['targets'],
-        packages: parseJsonField(parts.packages) as ExportRequestInput['packages'],
-        lockfileText: parts.lockfile ? (parts.lockfile as Buffer).toString('utf8') : undefined,
-        packageJsonText: parts.packageJson ? (parts.packageJson as Buffer).toString('utf8') : undefined
+        source: fieldValue(parts, 'source') as ExportRequestInput['source'],
+        registry: fieldValue(parts, 'registry'),
+        targets: parseJsonField(fieldValue(parts, 'targets')) as ExportRequestInput['targets'],
+        packages: parseJsonField(fieldValue(parts, 'packages')) as ExportRequestInput['packages'],
+        lockfileText: fileValue(parts, 'lockfile')?.toString('utf8'),
+        packageJsonText: fileValue(parts, 'packageJson')?.toString('utf8')
       };
     } else {
       data = request.body as ExportRequestInput;
@@ -107,27 +133,30 @@ export async function registerApiRoutes(app: FastifyInstance, config: AppConfig)
 
   app.post('/api/imports', async (request, reply) => {
     if (!request.isMultipart()) {
-      return reply.code(400).send({ error: '请使用 multipart 上传 zip' });
+      return reply.code(400).send({ error: '请使用 multipart 上传包归档' });
     }
     const parts = await readMultipart(request);
-    const file = parts.file as Buffer | undefined;
-    const registry = parts.registry as string | undefined;
+    const uploadedFile = fileField(parts, 'file');
+    const file = uploadedFile?.value;
+    const registry = fieldValue(parts, 'registry');
     if (!file || !registry) {
-      return reply.code(400).send({ error: '缺少 zip 文件或目标 registry' });
+      return reply.code(400).send({ error: '缺少包归档文件或目标 registry' });
     }
 
     const job = store.createImport({ status: 'pending', message: '上传完成，等待处理' });
-    const zipPath = path.join(config.dataDir, 'imports', `${job.id}.zip`);
+    const extension = uploadedFile.filename ? path.extname(uploadedFile.filename).toLowerCase() : '';
+    const safeExtension = ['.zip', '.tgz', '.gz'].includes(extension) ? extension : '.zip';
+    const zipPath = path.join(config.dataDir, 'imports', `${job.id}${safeExtension}`);
     fs.writeFileSync(zipPath, file);
     store.update(job.id, { zipPath });
 
     const data: ImportRequestInput = {
       registry: trimRegistry(registry),
-      authType: (parts.authType as ImportRequestInput['authType']) || 'none',
+      authType: (fieldValue(parts, 'authType') as ImportRequestInput['authType']) || 'none',
       credentials: {
-        token: parts.token as string | undefined,
-        username: parts.username as string | undefined,
-        password: parts.password as string | undefined
+        token: fieldValue(parts, 'token'),
+        username: fieldValue(parts, 'username'),
+        password: fieldValue(parts, 'password')
       }
     };
     void runImportJob({ job, data, store, config }).catch(() => undefined);
